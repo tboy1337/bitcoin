@@ -274,6 +274,137 @@ class PSBTTest(BitcoinTestFramework):
         assert "participant_pubkeys" in out_participant_pks
         assert_equal(out_participant_pks["participant_pubkeys"], [out_pubkey1.hex(), out_pubkey2.hex()])
 
+    def test_musig2_invalid_pubkey_validation(self):
+        self.log.info("Test MuSig2 pubkey validation prevents acceptance of invalid pubkeys in PSBT deserialization")
+        self.log.info("This is a regression test ensuring that invalid pubkeys in MuSig2 fields are properly rejected")
+        self.log.info("rather than being accepted and potentially causing crashes or invalid behavior later")
+
+        # Create a basic transaction for the PSBT
+        tx = CTransaction()
+        tx.vin = [CTxIn(outpoint=COutPoint(hash=int('ee' * 32, 16), n=0), scriptSig=b"")]
+        tx.vout = [CTxOut(nValue=0, scriptPubKey=b"")]
+        psbt = PSBT()
+        psbt.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+
+        # Generate some valid keys for comparison
+        _, valid_pubkey1 = generate_keypair()
+        _, valid_pubkey2 = generate_keypair()
+        _, valid_agg_pubkey = generate_keypair()
+        fake_leaf_hash = randbytes(32)
+
+        # Create invalid pubkeys (random bytes that are not valid curve points)
+        invalid_pubkey_compressed = randbytes(33)  # 33 bytes for compressed pubkey
+        invalid_agg_pubkey_compressed = randbytes(33)
+
+        # Test 1: Invalid aggregate pubkey in MuSig2 pubnonce field
+        self.log.info("Testing invalid aggregate pubkey in MuSig2 pubnonce field")
+        participant1_keydata_invalid_agg = invalid_pubkey_compressed + invalid_agg_pubkey_compressed + fake_leaf_hash
+        psbt_invalid_agg = PSBT()
+        psbt_invalid_agg.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_agg.o = [PSBTMap()]
+        psbt_invalid_agg.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PUB_NONCE]) + participant1_keydata_invalid_agg: randbytes(66),  # fake pubnonce
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 aggregate pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_agg.to_base64())
+
+        # Test 2: Invalid participant pubkey in MuSig2 pubnonce field
+        self.log.info("Testing invalid participant pubkey in MuSig2 pubnonce field")
+        participant1_keydata_invalid_part = invalid_pubkey_compressed + valid_agg_pubkey + fake_leaf_hash
+        psbt_invalid_part = PSBT()
+        psbt_invalid_part.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_part.o = [PSBTMap()]
+        psbt_invalid_part.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PUB_NONCE]) + participant1_keydata_invalid_part: randbytes(66),  # fake pubnonce
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 participant pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_part.to_base64())
+
+        # Test 3: Invalid aggregate pubkey in MuSig2 partial signature field
+        self.log.info("Testing invalid aggregate pubkey in MuSig2 partial signature field")
+        participant1_keydata_invalid_agg_sig = invalid_pubkey_compressed + invalid_agg_pubkey_compressed + fake_leaf_hash
+        psbt_invalid_agg_sig = PSBT()
+        psbt_invalid_agg_sig.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_agg_sig.o = [PSBTMap()]
+        psbt_invalid_agg_sig.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PARTIAL_SIG]) + participant1_keydata_invalid_agg_sig: randbytes(32),  # fake partial sig
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 aggregate pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_agg_sig.to_base64())
+
+        # Test 4: Invalid participant pubkey in MuSig2 partial signature field
+        self.log.info("Testing invalid participant pubkey in MuSig2 partial signature field")
+        participant1_keydata_invalid_part_sig = invalid_pubkey_compressed + valid_agg_pubkey + fake_leaf_hash
+        psbt_invalid_part_sig = PSBT()
+        psbt_invalid_part_sig.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_part_sig.o = [PSBTMap()]
+        psbt_invalid_part_sig.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PARTIAL_SIG]) + participant1_keydata_invalid_part_sig: randbytes(32),  # fake partial sig
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 participant pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_part_sig.to_base64())
+
+        # Test 5: Test with valid keys to ensure the fix doesn't break normal operation
+        self.log.info("Testing valid MuSig2 data still works")
+        participant1_keydata_valid = valid_pubkey1 + valid_agg_pubkey + fake_leaf_hash
+        psbt_valid = PSBT()
+        psbt_valid.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_valid.o = [PSBTMap()]
+        psbt_valid.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PUB_NONCE]) + participant1_keydata_valid: randbytes(66),  # fake pubnonce
+            bytes([PSBT_IN_MUSIG2_PARTIAL_SIG]) + participant1_keydata_valid: randbytes(32),  # fake partial sig
+        })]
+
+        # This should not raise an error
+        result = self.nodes[0].decodepsbt(psbt_valid.to_base64())
+        assert_equal(len(result["inputs"]), 1)
+        assert "musig2_pubnonces" in result["inputs"][0]
+        assert "musig2_partial_sigs" in result["inputs"][0]
+
+        # Test 6: Invalid participant pubkey in MuSig2 participant pubkeys field
+        self.log.info("Testing invalid participant pubkey in MuSig2 participant pubkeys field")
+        psbt_invalid_participant = PSBT()
+        psbt_invalid_participant.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_participant.o = [PSBTMap()]
+        psbt_invalid_participant.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS]) + valid_agg_pubkey: [invalid_pubkey_compressed, valid_pubkey1],
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 participant pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_participant.to_base64())
+
+        # Test 7: Invalid aggregate pubkey in MuSig2 participant pubkeys field
+        self.log.info("Testing invalid aggregate pubkey in MuSig2 participant pubkeys field")
+        psbt_invalid_agg_participant = PSBT()
+        psbt_invalid_agg_participant.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_agg_participant.o = [PSBTMap()]
+        psbt_invalid_agg_participant.i = [PSBTMap({
+            bytes([PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS]) + invalid_agg_pubkey_compressed: [valid_pubkey1, valid_pubkey2],
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 aggregate pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_agg_participant.to_base64())
+
+        # Test 8: Invalid participant pubkey in MuSig2 output participant pubkeys field
+        self.log.info("Testing invalid participant pubkey in MuSig2 output participant pubkeys field")
+        psbt_invalid_output_participant = PSBT()
+        psbt_invalid_output_participant.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_output_participant.i = [PSBTMap()]
+        psbt_invalid_output_participant.o = [PSBTMap({
+            bytes([PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS]) + valid_agg_pubkey: [invalid_pubkey_compressed, valid_pubkey1],
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 participant pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_output_participant.to_base64())
+
+        # Test 9: Invalid aggregate pubkey in MuSig2 output participant pubkeys field
+        self.log.info("Testing invalid aggregate pubkey in MuSig2 output participant pubkeys field")
+        psbt_invalid_agg_output = PSBT()
+        psbt_invalid_agg_output.g = PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: tx.serialize()})
+        psbt_invalid_agg_output.i = [PSBTMap()]
+        psbt_invalid_agg_output.o = [PSBTMap({
+            bytes([PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS]) + invalid_agg_pubkey_compressed: [valid_pubkey1, valid_pubkey2],
+        })]
+
+        assert_raises_rpc_error(-22, "musig2 aggregate pubkey is invalid", self.nodes[0].decodepsbt, psbt_invalid_agg_output.to_base64())
+
     def test_sighash_mismatch(self):
         self.log.info("Test sighash type mismatches")
         self.nodes[0].createwallet("sighash_mismatch")
@@ -1169,6 +1300,7 @@ class PSBTTest(BitcoinTestFramework):
             assert_equal(res_input[preimage_key][hash.hex()], preimage.hex())
 
         self.test_decodepsbt_musig2_input_output_types()
+        self.test_musig2_invalid_pubkey_validation()
 
         self.log.info("Test that combining PSBTs with different transactions fails")
         tx = CTransaction()

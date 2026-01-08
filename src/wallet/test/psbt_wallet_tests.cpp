@@ -4,6 +4,7 @@
 
 #include <key_io.h>
 #include <node/types.h>
+#include <psbt.h>
 #include <util/bip32.h>
 #include <util/strencodings.h>
 #include <wallet/wallet.h>
@@ -11,6 +12,11 @@
 #include <boost/test/unit_test.hpp>
 #include <test/util/setup_common.h>
 #include <wallet/test/wallet_test_fixture.h>
+
+#include <array>
+#include <iostream>
+#include <sstream>
+#include <string>
 
 using namespace util::hex_literals;
 
@@ -152,6 +158,111 @@ BOOST_AUTO_TEST_CASE(parse_hd_keypath)
 
     BOOST_CHECK(ParseHDKeypath("m/4294967295", keypath)); // 4294967295 == 0xFFFFFFFF (uint32_t max)
     BOOST_CHECK(!ParseHDKeypath("m/4294967296", keypath)); // 4294967296 == 0xFFFFFFFF (uint32_t max) + 1
+}
+
+BOOST_AUTO_TEST_CASE(musig2_pubkey_validation)
+{
+    // Test data - valid compressed pubkey for testing
+    std::array<unsigned char, CPubKey::COMPRESSED_SIZE> valid_pubkey_bytes = {
+        0x02, 0xf9, 0x30, 0x8a, 0x01, 0x92, 0x58, 0xc3, 0x10, 0x49, 0x34, 0x4f, 0x85, 0xf8, 0x9d, 0x52,
+        0x29, 0xb5, 0x31, 0xc8, 0x45, 0x83, 0x6f, 0x99, 0xb0, 0x86, 0x01, 0xf1, 0x13, 0xbc, 0xe0, 0x36, 0xf9
+    };
+    CPubKey valid_pubkey(valid_pubkey_bytes);
+
+    // Test data - invalid pubkey (all zeros)
+    std::array<unsigned char, CPubKey::COMPRESSED_SIZE> invalid_pubkey_bytes = {0};
+
+    // Test data - another invalid pubkey (point at infinity representation)
+    std::array<unsigned char, CPubKey::COMPRESSED_SIZE> infinity_pubkey_bytes = {0};
+    infinity_pubkey_bytes[0] = 0x00; // Infinity point in compressed form
+
+    BOOST_CHECK(valid_pubkey.IsFullyValid());
+    BOOST_CHECK(!CPubKey(invalid_pubkey_bytes).IsFullyValid());
+    BOOST_CHECK(!CPubKey(infinity_pubkey_bytes).IsFullyValid());
+
+    // Test valid pubkeys - should not throw
+    {
+        DataStream stream;
+        CPubKey agg_pub, part_pub;
+        uint256 leaf_hash;
+
+        // Write valid pubkeys to stream
+        stream << valid_pubkey_bytes << valid_pubkey_bytes;
+
+        BOOST_CHECK_NO_THROW(DeserializeMuSig2ParticipantDataIdentifier(stream, agg_pub, part_pub, leaf_hash));
+        BOOST_CHECK(agg_pub == valid_pubkey);
+        BOOST_CHECK(part_pub == valid_pubkey);
+        BOOST_CHECK(leaf_hash.IsNull());
+    }
+
+    // Test invalid aggregate pubkey - should throw
+    {
+        DataStream stream;
+        CPubKey agg_pub, part_pub;
+        uint256 leaf_hash;
+
+        // Write invalid aggregate pubkey, valid participant pubkey
+        stream << valid_pubkey_bytes << invalid_pubkey_bytes;
+
+        BOOST_CHECK_EXCEPTION(DeserializeMuSig2ParticipantDataIdentifier(stream, agg_pub, part_pub, leaf_hash),
+                             std::ios_base::failure, HasReason("musig2 aggregate pubkey is invalid"));
+    }
+
+    // Test invalid participant pubkey - should throw
+    {
+        DataStream stream;
+        CPubKey agg_pub, part_pub;
+        uint256 leaf_hash;
+
+        // Write valid aggregate pubkey, invalid participant pubkey
+        stream << invalid_pubkey_bytes << valid_pubkey_bytes;
+
+        BOOST_CHECK_EXCEPTION(DeserializeMuSig2ParticipantDataIdentifier(stream, agg_pub, part_pub, leaf_hash),
+                             std::ios_base::failure, HasReason("musig2 participant pubkey is invalid"));
+    }
+
+    // Test both pubkeys invalid - should throw (aggregate checked first)
+    {
+        DataStream stream;
+        CPubKey agg_pub, part_pub;
+        uint256 leaf_hash;
+
+        // Write both invalid pubkeys
+        stream << invalid_pubkey_bytes << invalid_pubkey_bytes;
+
+        BOOST_CHECK_EXCEPTION(DeserializeMuSig2ParticipantDataIdentifier(stream, agg_pub, part_pub, leaf_hash),
+                             std::ios_base::failure, HasReason("musig2 aggregate pubkey is invalid"));
+    }
+
+    // Test with leaf hash present
+    {
+        DataStream stream;
+        CPubKey agg_pub, part_pub;
+        uint256 leaf_hash;
+        uint256 test_leaf_hash = uint256::ONE;
+
+        // Write valid pubkeys and leaf hash
+        stream << valid_pubkey_bytes << valid_pubkey_bytes << test_leaf_hash;
+
+        BOOST_CHECK_NO_THROW(DeserializeMuSig2ParticipantDataIdentifier(stream, agg_pub, part_pub, leaf_hash));
+        BOOST_CHECK(agg_pub == valid_pubkey);
+        BOOST_CHECK(part_pub == valid_pubkey);
+        BOOST_CHECK(leaf_hash == test_leaf_hash);
+    }
+
+    // Test invalid pubkey with leaf hash - should still throw
+    {
+        DataStream stream;
+        CPubKey agg_pub, part_pub;
+        uint256 leaf_hash;
+        uint256 test_leaf_hash = uint256::ONE;
+
+        // Write invalid aggregate pubkey, valid participant pubkey, and leaf hash
+        stream << valid_pubkey_bytes << invalid_pubkey_bytes << test_leaf_hash;
+
+        BOOST_CHECK_EXCEPTION(DeserializeMuSig2ParticipantDataIdentifier(stream, agg_pub, part_pub, leaf_hash),
+                             std::ios_base::failure, HasReason("musig2 aggregate pubkey is invalid"));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
